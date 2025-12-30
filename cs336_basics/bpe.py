@@ -204,17 +204,42 @@ def pretokenize_documents(documents: list[str]) -> dict[tuple[int, ...], int]:
     return word_counts
 
 def main():
+    import json
+    import tracemalloc
+
     num_processes = None
     Tiny_train_set = "./data/TinyStoriesV2-GPT4-train.txt"
     Tiny_validation_set = "./data/TinyStoriesV2-GPT4-valid.txt"
     tiny_set = "./data/tiny.txt"
     special_tokens = ["<|endoftext|>"]
 
-    # word_counts = parallel_pretokenize(Tiny_validation_set, special_tokens, num_processes)
-    # print(word_counts)
+    # Track memory usage
+    tracemalloc.start()
 
     vocab, merges = train_bpe(Tiny_train_set, 10000, special_tokens)
-    pprint(merges[:10])
+
+    # Get peak memory usage
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f"Peak memory usage: {peak / 1024 / 1024:.2f} MB")
+
+    # Find and print the longest token
+    longest_token = max(vocab.values(), key=len)
+    print(f"Longest token ({len(longest_token)} bytes): {longest_token}")
+
+    # Serialize vocab and merges to disk
+    # Vocab: convert bytes to hex strings for JSON compatibility
+    vocab_serializable = {str(k): v.hex() for k, v in vocab.items()}
+    with open("vocab.json", "w") as f:
+        json.dump(vocab_serializable, f, indent=2)
+
+    # Merges: save as text file (one merge per line, hex-encoded)
+    with open("merges.txt", "w") as f:
+        for b1, b2 in merges:
+            f.write(f"{b1.hex()} {b2.hex()}\n")
+
+    print(f"Saved vocab ({len(vocab)} tokens) to vocab.json")
+    print(f"Saved merges ({len(merges)} merges) to merges.txt")
 
 if __name__ == '__main__':
     profile = True 
