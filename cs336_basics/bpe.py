@@ -6,21 +6,27 @@ from pprint import pprint
 from heapq import heappush, heappop
 from functools import total_ordering
 
-@total_ordering
-class ReversedBytes:
-    """Wrapper for bytes that reverses comparison order (larger bytes compare as smaller)"""
-    __slots__ = ['b']
-    def __init__(self, b: bytes):
-        self.b = b
-    def __lt__(self, other):
-        return self.b > other.b  # Reversed: larger bytes come first in min-heap
-    def __eq__(self, other):
-        return self.b == other.b
+_INV_TABLE = bytes.maketrans(bytes(range(256)), bytes(range(255, -1, -1)))
+
+def revlex_key(b: bytes) -> bytes:
+    """
+    Key with the property:
+        a > b   <=>   revlex_key(a) < revlex_key(b)
+    using normal bytes comparison.
+
+    The 0x00 interleaving + 0xFF terminator fixes the prefix case.
+    """
+    inv = b.translate(_INV_TABLE)
+    n = len(inv)
+    out = bytearray(2 * n + 1)
+    out[1:2*n:2] = inv   # 0x00, inv[0], 0x00, inv[1], ...
+    out[2*n] = 0xFF      # terminator so shorter originals sort after longer
+    return bytes(out)
 
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     word_counts : dict[tuple[int, ...], int]= parallel_pretokenize(input_path, special_tokens)
     vocab : dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
-    vocab_negated : dict[int, ReversedBytes] = {idx: ReversedBytes(bytes([idx])) for idx in range(256)}
+    vocab_key: dict[int, bytes] = {idx: revlex_key(vocab[idx]) for idx in range(256)}
     merges : list[tuple[bytes, bytes]]  = []
     pair_counts : Counter[tuple[int, int]] = Counter() # tracks how many times each pair of tokens shows up 
     pair_counts_heap = [] # (negative count, negative underlying bytes, token pair) to get the token pair with largest count and highest lexicographical order. The pair is just there so that we actually know what pair it corresponds to when we pop it
@@ -36,9 +42,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tu
 
     def add_to_heap(pair, count):
         # Use tuple comparison for lexicographic tiebreaker
-        # ReversedBytes reverses comparison so min-heap gives max lexicographic order
-        reversed_tuple = (vocab_negated[pair[0]], vocab_negated[pair[1]])
-        heappush(pair_counts_heap, (-count, reversed_tuple, pair))
+        heappush(pair_counts_heap, (-count, vocab_key[pair[0]], vocab_key[pair[1]], pair))
     
     for pair, count in pair_counts.items(): 
         add_to_heap(pair, count) 
@@ -55,7 +59,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tu
         # 1. look at the highest count pair, broken by largest lexicographical order
         best_pair = None
         while pair_counts_heap:
-            neg_count, _, pair = heappop(pair_counts_heap)
+            neg_count, _, _, pair = heappop(pair_counts_heap)
             count = -neg_count
             if pair in pair_counts and pair_counts[pair] == count:
                 # up to date pair and count 
@@ -70,7 +74,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tu
         bytes_2 = vocab[best_pair[1]]
         new_token = len(vocab)
         vocab[new_token] = bytes_1 + bytes_2
-        vocab_negated[new_token] = ReversedBytes(bytes_1 + bytes_2)
+        vocab_key[new_token] = revlex_key(bytes_1 + bytes_2)
         merges.append((bytes_1, bytes_2))
 
         # 3. go through all words with that pair. 
@@ -211,12 +215,15 @@ def main():
     Tiny_train_set = "./data/TinyStoriesV2-GPT4-train.txt"
     Tiny_validation_set = "./data/TinyStoriesV2-GPT4-valid.txt"
     tiny_set = "./data/tiny.txt"
+    OWT_train_set = "./data/owt_train.txt"
+    OWT_validation_set = "./data/owt_valid.txt"
     special_tokens = ["<|endoftext|>"]
 
     # Track memory usage
     tracemalloc.start()
 
-    vocab, merges = train_bpe(Tiny_train_set, 10000, special_tokens)
+    vocab, merges = train_bpe(Tiny_validation_set, 10000, special_tokens)
+    # vocab, merges = train_bpe(OWT_train_set, 32000, special_tokens)
 
     # Get peak memory usage
     current, peak = tracemalloc.get_traced_memory()
@@ -230,16 +237,16 @@ def main():
     # Serialize vocab and merges to disk
     # Vocab: convert bytes to hex strings for JSON compatibility
     vocab_serializable = {str(k): v.hex() for k, v in vocab.items()}
-    with open("vocab.json", "w") as f:
+    with open("vocab_OWT.json", "w") as f:
         json.dump(vocab_serializable, f, indent=2)
 
     # Merges: save as text file (one merge per line, hex-encoded)
-    with open("merges.txt", "w") as f:
+    with open("merges_OWT.txt", "w") as f:
         for b1, b2 in merges:
             f.write(f"{b1.hex()} {b2.hex()}\n")
 
-    print(f"Saved vocab ({len(vocab)} tokens) to vocab.json")
-    print(f"Saved merges ({len(merges)} merges) to merges.txt")
+    print(f"Saved vocab ({len(vocab)} tokens) to vocab_OWT.json")
+    print(f"Saved merges ({len(merges)} merges) to merges_OWT.txt")
 
 if __name__ == '__main__':
     profile = True 
