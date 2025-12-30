@@ -55,7 +55,12 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tu
     # b. Update word_counts with the new words, delete the old words
     # c. Update pair_counts by subtracting the pair counts for the old word, adding the pair counts for the new word (can use .update and .subtract on Counters). Update the heap by pushing on the new pair with the new count
     # d. Update pair_to_words by removing the word from all the old pairs in it, and adding the word for all the new pairs in it
+    counter = 1
+    total = vocab_size - len(special_tokens) - len(vocab)
     while len(vocab) < vocab_size - len(special_tokens):
+        if counter % 100 == 0:
+            print(f"Doing merge {counter}/{total}")
+        counter += 1
         # 1. look at the highest count pair, broken by largest lexicographical order
         best_pair = None
         while pair_counts_heap:
@@ -222,8 +227,8 @@ def main():
     # Track memory usage
     tracemalloc.start()
 
-    vocab, merges = train_bpe(Tiny_validation_set, 10000, special_tokens)
-    # vocab, merges = train_bpe(OWT_train_set, 32000, special_tokens)
+    # vocab, merges = train_bpe(Tiny_validation_set, 10000, special_tokens)
+    vocab, merges = train_bpe(OWT_validation_set, 10000, special_tokens)
 
     # Get peak memory usage
     current, peak = tracemalloc.get_traced_memory()
