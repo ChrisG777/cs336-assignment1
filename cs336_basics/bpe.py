@@ -3,8 +3,7 @@ import regex as re
 from collections import defaultdict, Counter
 from .pretokenization_example import find_chunk_boundaries
 from pprint import pprint
-from heapq import heappush, heappop
-from functools import total_ordering
+import heapq
 
 _INV_TABLE = bytes.maketrans(bytes(range(256)), bytes(range(255, -1, -1)))
 
@@ -23,127 +22,270 @@ def revlex_key(b: bytes) -> bytes:
     out[2*n] = 0xFF      # terminator so shorter originals sort after longer
     return bytes(out)
 
+# Pack a pair (a,b) into a single int to reduce dict/set overhead.
+# SHIFT must be > max token id bits. 20 supports up to ~1M tokens.
+_SHIFT = 20
+_MASK = (1 << _SHIFT) - 1
+
+def _pack_pair(a: int, b: int) -> int:
+    return (a << _SHIFT) | b
+
+def _unpack_pair(p: int) -> tuple[int, int]:
+    return p >> _SHIFT, p & _MASK
+
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    word_counts : dict[tuple[int, ...], int]= parallel_pretokenize(input_path, special_tokens)
-    vocab : dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
-    vocab_key: dict[int, bytes] = {idx: revlex_key(vocab[idx]) for idx in range(256)}
-    merges : list[tuple[bytes, bytes]]  = []
-    pair_counts : Counter[tuple[int, int]] = Counter() # tracks how many times each pair of tokens shows up 
-    pair_counts_heap = [] # (negative count, negative underlying bytes, token pair) to get the token pair with largest count and highest lexicographical order. The pair is just there so that we actually know what pair it corresponds to when we pop it
-    # we won't bother to get rid of stale entries from this heap. Instead, when we pop, we'll just cross check with pair_counts to see if the count is stale
-    # i.e., the invariant we'll keep is that all up to date pair counts are in the heap, so if an unstale count is the max, then it really must be higher than all the up to date counts
-    pair_to_words : defaultdict[tuple[int, int], set[tuple[int, ...]]] = defaultdict(set) # tracks in which words each pair of tokens shows up 
+    # --- 1) Pretokenize ---
+    word_counts_dict: dict[tuple[int, ...], int] = parallel_pretokenize(input_path, special_tokens)
 
-    # initialize everything 
-    for word, count in word_counts.items():
-        pair_counts.update(scale_counter(pair_counts_in_word(word), count))
-        for token, next_token in zip(word[:-1], word[1:]):
-            pair_to_words[(token, next_token)].add(word)
+    # Convert to ID-based storage so pair_to_words stores ints (fast hash),
+    # not whole tuples (slow hash + more memory).
+    words: list[tuple[int, ...] | None] = list(word_counts_dict.keys())
+    counts: list[int] = list(word_counts_dict.values())
+    word_to_id: dict[tuple[int, ...], int] = {w: i for i, w in enumerate(words)}
+    del word_counts_dict  # allow GC of big dict
 
-    def add_to_heap(pair, count):
-        # Use tuple comparison for lexicographic tiebreaker
-        heappush(pair_counts_heap, (-count, vocab_key[pair[0]], vocab_key[pair[1]], pair))
+    # --- 2) Vocab as lists (faster than dicts for 0..N-1 ids) ---
+    vocab: list[bytes] = [bytes([i]) for i in range(256)]
+    vocab_key: list[bytes] = [revlex_key(tok) for tok in vocab]
+    merges: list[tuple[bytes, bytes]] = []
+
+    # --- 3) pair_counts and pair_to_words ---
+    pair_counts: dict[int, int] = defaultdict(int)   # pair_key -> count
+    pair_to_words: dict[int, set[int]] = {}          # pair_key -> {word_id}
+
+    # Build initial counts/mapping without tuple slicing
+    for wid, (w, c) in enumerate(zip(words, counts)):
+        if c == 0 or w is None or len(w) < 2:
+            continue
+        it = iter(w)
+        prev = next(it)
+        seen_pairs = set()
+        for tok in it:
+            pk = _pack_pair(prev, tok)
+            pair_counts[pk] += c
+            if pk not in seen_pairs:
+                pair_to_words.setdefault(pk, set()).add(wid)
+                seen_pairs.add(pk)
+            prev = tok
+
+    # --- 4) Heap with entry_finder + periodic rebuild ---
+    heap: list[tuple[int, bytes, bytes, int]] = []
+    entry_finder: dict[int, tuple[int, bytes, bytes, int]] = {}
+
+    heappush = heapq.heappush
+    heappop = heapq.heappop
+    heapify = heapq.heapify
+
+    def heap_set(pk: int, c: int) -> None:
+        """Set/update the heap priority for pk to count c (must be >0)."""
+        a, b = _unpack_pair(pk)
+        entry = (-c, vocab_key[a], vocab_key[b], pk)
+        entry_finder[pk] = entry
+        heappush(heap, entry)
+
+    # init heap
+    for pk, c in pair_counts.items():
+        if c > 0:
+            heap_set(pk, c)
+
+    def heap_pop_best() -> tuple[int, int]:
+        """Return (pair_key, count) for the current max pair."""
+        while heap:
+            entry = heappop(heap)
+            pk = entry[3]
+            if entry_finder.get(pk) is entry:
+                del entry_finder[pk]
+                return pk, -entry[0]
+        raise ValueError("No pairs left to merge (corpus too small for requested vocab_size).")
+
+    def maybe_rebuild_heap() -> None:
+        # If heap is mostly stale, rebuild from entry_finder values.
+        # Tune the constants if needed.
+        if len(heap) > 4 * len(entry_finder) + 200_000:
+            heap[:] = list(entry_finder.values())
+            heapify(heap)
+
+    # --- 5) Helpers to update counts and pair_to_words without slicing ---
+    def adjust_pair_counts(seq: tuple[int, ...] | None, delta: int, touched: set[int]) -> None:
+        if seq is None or len(seq) < 2:
+            return
+        it = iter(seq)
+        prev = next(it)
+        for tok in it:
+            pk = _pack_pair(prev, tok)
+            pair_counts[pk] += delta
+            touched.add(pk)
+            prev = tok
+
+    def remove_word_from_pairs(wid: int, seq: tuple[int, ...] | None) -> None:
+        if seq is None or len(seq) < 2:
+            return
+        it = iter(seq)
+        prev = next(it)
+        seen = set()
+        for tok in it:
+            pk = _pack_pair(prev, tok)
+            if pk not in seen:
+                s = pair_to_words.get(pk)
+                if s is not None:
+                    s.discard(wid)
+                    if not s:
+                        pair_to_words.pop(pk, None)
+                seen.add(pk)
+            prev = tok
+
+    def add_word_to_pairs(wid: int, seq: tuple[int, ...]) -> None:
+        if len(seq) < 2:
+            return
+        it = iter(seq)
+        prev = next(it)
+        seen = set()
+        for tok in it:
+            pk = _pack_pair(prev, tok)
+            if pk not in seen:
+                pair_to_words.setdefault(pk, set()).add(wid)
+                seen.add(pk)
+            prev = tok
+
+    # --- 6) Merge loop ---
+    target_vocab_no_special = vocab_size - len(special_tokens)
+    total_merges = target_vocab_no_special - len(vocab)
     
-    for pair, count in pair_counts.items(): 
-        add_to_heap(pair, count) 
+    for merge_i in range(total_merges):
+        if (merge_i + 1) % 100 == 0:
+            print(f"Doing merge {merge_i + 1} out of {total_merges}")
 
-    # during the merging process, on each merge we 
-    # 1. look at the highest count pair, broken by largest lexicographical order
-    # 2. add that to merges, and add the new token to vocab
-    # 3. go through all words with that pair. 
-    # a. Get the old word, and get the new word
-    # b. Update word_counts with the new words, delete the old words
-    # c. Update pair_counts by subtracting the pair counts for the old word, adding the pair counts for the new word (can use .update and .subtract on Counters). Update the heap by pushing on the new pair with the new count
-    # d. Update pair_to_words by removing the word from all the old pairs in it, and adding the word for all the new pairs in it
-    counter = 1
-    total = vocab_size - len(special_tokens) - len(vocab)
-    while len(vocab) < vocab_size - len(special_tokens):
-        if counter % 100 == 0:
-            print(f"Doing merge {counter}/{total}")
-        counter += 1
-        # 1. look at the highest count pair, broken by largest lexicographical order
-        best_pair = None
-        while pair_counts_heap:
-            neg_count, _, _, pair = heappop(pair_counts_heap)
-            count = -neg_count
-            if pair in pair_counts and pair_counts[pair] == count:
-                # up to date pair and count 
-                best_pair = pair
-                break
-        if best_pair is None:
-            raise ValueError("should be getting some pair from the heap")
-        # best_pair = max(pair_counts, key=lambda p: (pair_counts[p], vocab[p[0]] + vocab[p[1]]))
+        best_pk, best_count = heap_pop_best()
 
-        # 2. add that to merges, and add the new token to vocab
-        bytes_1 = vocab[best_pair[0]]
-        bytes_2 = vocab[best_pair[1]]
+        # If this pair has no words anymore (stale), drop and continue.
+        affected = pair_to_words.pop(best_pk, None)
+        if not affected:
+            pair_counts.pop(best_pk, None)
+            maybe_rebuild_heap()
+            continue
+
+        a, b = _unpack_pair(best_pk)
+        bytes_1 = vocab[a]
+        bytes_2 = vocab[b]
+
         new_token = len(vocab)
-        vocab[new_token] = bytes_1 + bytes_2
-        vocab_key[new_token] = revlex_key(bytes_1 + bytes_2)
+        new_bytes = bytes_1 + bytes_2
+        vocab.append(new_bytes)
+        vocab_key.append(revlex_key(new_bytes))
         merges.append((bytes_1, bytes_2))
 
-        # 3. go through all words with that pair. 
-        for word in list(pair_to_words[best_pair]): # list to get a copy
-            num_word_occurrences = word_counts[word] 
+        # Process each affected word id
+        for wid in affected:
+            wcount = counts[wid]
+            if wcount == 0:
+                continue
 
-            # a. Get the old word, and get the new word
-            old_word = word
-            new_word = transform_word(word, best_pair, new_token)
-            # b. Update word_counts with the new words, delete the old words
-            word_counts[new_word] = word_counts.get(new_word, 0) + word_counts[old_word] # have to add in case two old words map to the same new word
-            del word_counts[old_word]
-            
+            old_word = words[wid]
+            if old_word is None:
+                continue
 
-            # c. Update pair_counts by subtracting the pair counts for the old word, adding the pair counts for the new word (can use .update and .subtract on Counters)
-            
-            pair_counts_old = scale_counter(pair_counts_in_word(old_word), num_word_occurrences)
-            pair_counts_new = scale_counter(pair_counts_in_word(new_word), num_word_occurrences)
+            new_word = _transform_word_fast(old_word, a, b, new_token)
 
-            pair_counts.update(pair_counts_new)
-            pair_counts.subtract(pair_counts_old)
-            for pair in pair_counts_new.keys() | pair_counts_old.keys(): 
-                if pair_counts[pair] > 0: 
-                    add_to_heap(pair, pair_counts[pair])
+            # Merge counts into existing/new word id
+            new_id = word_to_id.get(new_word)
+            created_new = False
+            if new_id is None:
+                new_id = len(words)
+                word_to_id[new_word] = new_id
+                words.append(new_word)
+                counts.append(wcount)
+                created_new = True
+            else:
+                # If somehow reactivating an old word id, re-add to pair sets
+                if counts[new_id] == 0:
+                    created_new = True
+                counts[new_id] += wcount
 
-            # d. Update pair_to_words by removing the word from all the old pairs in it, and adding the word for all the new pairs in it
-            for token, next_token in zip(old_word[:-1], old_word[1:]):
-                pair_to_words[(token, next_token)].discard(old_word) # discard instead of remove since it's idempotent
-            for token, next_token in zip(new_word[:-1], new_word[1:]):
-                pair_to_words[(token, next_token)].add(new_word)
+            # Deactivate old
+            counts[wid] = 0
+            # Remove old sequence from mapping + free list slot (saves memory)
+            word_to_id.pop(old_word, None)
+            words[wid] = None
 
-    # add in the special tokens
-    for special_token in special_tokens:
-        vocab[len(vocab)] = special_token.encode('utf-8')
-    return vocab, merges
+            # Update pair_to_words: remove old id from all its pairs
+            remove_word_from_pairs(wid, old_word)
 
-def scale_counter(counter: Counter, multiplier: int) -> Counter:
-    return Counter({key: count * multiplier for key, count in counter.items()})
+            # If this new_id is newly created/re-activated, add it to pair_to_words
+            if created_new:
+                add_word_to_pairs(new_id, new_word)
 
-def pair_counts_in_word(word: tuple[int, ...]) -> Counter[tuple[int, int]]:
-    """
-    Given a word, outputs a counter of how many times each pair of tokens apppears in that word
-    """
-    count : Counter[tuple[int, int]] = Counter() 
-    for token, next_token in zip(word[:-1], word[1:]):
-        count[(token, next_token)] += 1
-    return count
+            # Update global pair_counts + heap for touched pairs
+            touched: set[int] = set()
+            adjust_pair_counts(old_word, -wcount, touched)
+            adjust_pair_counts(new_word, +wcount, touched)
+
+            for pk in touched:
+                if pk == best_pk:
+                    # We're killing best_pk; never need it in heap again.
+                    continue
+                c = pair_counts.get(pk, 0)
+                if c <= 0:
+                    pair_counts.pop(pk, None)
+                    entry_finder.pop(pk, None)
+                else:
+                    heap_set(pk, c)
+
+        # best pair should now be gone
+        pair_counts.pop(best_pk, None)
+        entry_finder.pop(best_pk, None)
+
+        maybe_rebuild_heap()
+
+    # Add special tokens at the end
+    for st in special_tokens:
+        vocab.append(st.encode("utf-8"))
+
+    # Return as dict[int, bytes] to match your existing interface
+    vocab_dict = {i: tok for i, tok in enumerate(vocab)}
+    return vocab_dict, merges
 
 
-def transform_word(word: tuple[int, ...], pair: tuple[int, int], new_token) -> tuple[int, ...]:
-    """
-    transforms the word, replacing the old byte pair by the new token left to right
-    """
-    new_word = []
+# def scale_counter(counter: Counter, multiplier: int) -> Counter:
+#     return Counter({key: count * multiplier for key, count in counter.items()})
+
+# def pair_counts_in_word(word: tuple[int, ...]) -> Counter[tuple[int, int]]:
+#     """
+#     Given a word, outputs a counter of how many times each pair of tokens apppears in that word
+#     """
+#     count : Counter[tuple[int, int]] = Counter() 
+#     for token, next_token in zip(word[:-1], word[1:]):
+#         count[(token, next_token)] += 1
+#     return count
+
+
+# def transform_word(word: tuple[int, ...], pair: tuple[int, int], new_token) -> tuple[int, ...]:
+#     """
+#     transforms the word, replacing the old byte pair by the new token left to right
+#     """
+#     new_word = []
+#     i = 0
+#     while i < len(word):
+#         if i < len(word)-1 and (word[i], word[i+1]) == pair:
+#             new_word.append(new_token)
+#             i += 2
+#         else:
+#             new_word.append(word[i]) 
+#             i += 1
+#     return tuple(new_word)
+def _transform_word_fast(word: tuple[int, ...], a: int, b: int, new_token: int) -> tuple[int, ...]:
+    # Replaces occurrences of (a,b) left-to-right.
+    out = []
+    append = out.append
     i = 0
-    while i < len(word):
-        if i < len(word)-1 and (word[i], word[i+1]) == pair:
-            new_word.append(new_token)
+    n = len(word)
+    while i < n:
+        if i + 1 < n and word[i] == a and word[i + 1] == b:
+            append(new_token)
             i += 2
         else:
-            new_word.append(word[i]) 
+            append(word[i])
             i += 1
-    return tuple(new_word)
-
+    return tuple(out)
 
 
 def pretokenize_chunk(args):
