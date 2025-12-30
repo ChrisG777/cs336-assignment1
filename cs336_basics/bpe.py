@@ -20,6 +20,7 @@ class ReversedBytes:
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     word_counts : dict[tuple[int, ...], int]= parallel_pretokenize(input_path, special_tokens)
     vocab : dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
+    vocab_negated : dict[int, ReversedBytes] = {idx: ReversedBytes(bytes([idx])) for idx in range(256)}
     merges : list[tuple[bytes, bytes]]  = []
     pair_counts : Counter[tuple[int, int]] = Counter() # tracks how many times each pair of tokens shows up 
     pair_counts_heap = [] # (negative count, negative underlying bytes, token pair) to get the token pair with largest count and highest lexicographical order. The pair is just there so that we actually know what pair it corresponds to when we pop it
@@ -36,7 +37,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tu
     def add_to_heap(pair, count):
         # Use tuple comparison for lexicographic tiebreaker
         # ReversedBytes reverses comparison so min-heap gives max lexicographic order
-        reversed_tuple = (ReversedBytes(vocab[pair[0]]), ReversedBytes(vocab[pair[1]]))
+        reversed_tuple = (vocab_negated[pair[0]], vocab_negated[pair[1]])
         heappush(pair_counts_heap, (-count, reversed_tuple, pair))
     
     for pair, count in pair_counts.items(): 
@@ -69,6 +70,7 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tu
         bytes_2 = vocab[best_pair[1]]
         new_token = len(vocab)
         vocab[new_token] = bytes_1 + bytes_2
+        vocab_negated[new_token] = ReversedBytes(bytes_1 + bytes_2)
         merges.append((bytes_1, bytes_2))
 
         # 3. go through all words with that pair. 
