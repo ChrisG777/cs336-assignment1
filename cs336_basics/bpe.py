@@ -213,7 +213,7 @@ def main():
     # word_counts = parallel_pretokenize(Tiny_validation_set, special_tokens, num_processes)
     # print(word_counts)
 
-    vocab, merges = train_bpe(Tiny_validation_set, 10000, special_tokens)
+    vocab, merges = train_bpe(Tiny_train_set, 10000, special_tokens)
     pprint(merges[:10])
 
 if __name__ == '__main__':
