@@ -575,7 +575,7 @@ def main():
 
 
 if __name__ == "__main__":
-    profile = True
+    profile = False
     if profile:
         import cProfile
         import pstats

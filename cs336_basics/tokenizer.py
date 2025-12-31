@@ -187,52 +187,209 @@ def replace_merged_bytes(byte_sequence: list[bytes], byte_pair: tuple[bytes, byt
     return new_bytes_sequence
 
 
-if __name__ == '__main__':   
-    tokenizer = Tokenizer.from_files("vocab.json", "merges.txt", special_tokens=["<|endoftext|>"])
-
-    # had cursor write some tests for me bc I'm lazy lol
-
-    # Test 3: Encode a file
-    print("\n--- Test 3: Encode tiny.txt ---")
-    tiny_set = "./data/tiny.txt"
-    with open(tiny_set, "r") as f:
-        body = f.read()
-    tokens = tokenizer.encode(body)
-    print(f"File length: {len(body)} chars")
-    print(f"Token count: {len(tokens)}")
-    print(f"First 20 tokens: {tokens[:20]}")
+def tokenize_n_documents(
+    tokenizer: Tokenizer,
+    dataset_path: str,
+    n: int,
+    special_token: str = "<|endoftext|>",
+    verbose: bool = True,
+) -> tuple[list[int], dict]:
+    """
+    Written by cur
+    Sample and tokenize n documents from a dataset.
     
-    # Test 4: encode_iterable (streaming)
-    print("\n--- Test 4: encode_iterable (streaming) ---")
-    with open(tiny_set, "r") as f:
-        iterable_tokens = list(tokenizer.encode_iterable(f))
-    print(f"Iterable token count: {len(iterable_tokens)}")
-    print(f"First 20 tokens: {iterable_tokens[:20]}")
+    Args:
+        tokenizer: A Tokenizer instance
+        dataset_path: Path to the dataset file (documents separated by special_token)
+        n: Number of documents to tokenize
+        special_token: The token that separates documents
+        verbose: Whether to print progress
+        
+    Returns:
+        tuple of (token_ids, stats) where stats is a dict with:
+            - num_documents: number of documents tokenized
+            - total_chars: total characters in documents
+            - total_bytes: total bytes in documents (UTF-8)
+            - total_tokens: total tokens produced
+            - bytes_per_token: compression ratio
+    """
+    with open(dataset_path, "r") as f:
+        content = f.read()
     
-    # Test 5: Compare encode vs encode_iterable
-    print("\n--- Test 5: encode vs encode_iterable consistency ---")
-    if tokens == iterable_tokens:
-        print("✓ PASS: encode() and encode_iterable() produce identical results")
+    # Split by special token to get individual documents
+    documents = content.split(special_token)[:n]
+    
+    all_tokens = []
+    total_chars = 0
+    total_bytes = 0
+    
+    for i, doc in enumerate(documents):
+        doc = doc.strip()
+        if not doc:
+            continue
+        
+        # Add back the special token at the end
+        doc_with_special = doc + special_token
+        tokens = tokenizer.encode(doc_with_special)
+        all_tokens.extend(tokens)
+        
+        doc_bytes = len(doc_with_special.encode('utf-8'))
+        total_chars += len(doc_with_special)
+        total_bytes += doc_bytes
+        
+        if verbose:
+            print(f"Document {i+1}: {len(doc)} chars -> {len(tokens)} tokens")
+    
+    stats = {
+        "num_documents": len([d for d in documents if d.strip()]),
+        "total_chars": total_chars,
+        "total_bytes": total_bytes,
+        "total_tokens": len(all_tokens),
+        "bytes_per_token": total_bytes / len(all_tokens) if all_tokens else 0,
+    }
+    
+    if verbose:
+        print(f"\nTotal tokens: {stats['total_tokens']}")
+        print(f"Compression ratio: {stats['bytes_per_token']:.2f} bytes/token")
+    
+    return all_tokens, stats
+
+
+def tokenize_dataset(
+    dataset_path: str,
+    vocab_path: str,
+    merges_path: str,
+    output_path: str,
+    special_tokens: list[str] | None = None,
+    dtype = None,  # numpy dtype, default uint16
+) -> dict:
+    """
+    Tokenize an entire dataset and save as a numpy array.
+    
+    Args:
+        dataset_path: Path to the dataset file to tokenize
+        vocab_path: Path to the vocabulary JSON file
+        merges_path: Path to the merges file
+        output_path: Path to save the numpy array (.npy)
+        special_tokens: List of special tokens (default: ["<|endoftext|>"])
+        dtype: Numpy dtype for the output array (default: uint16)
+        
+    Returns:
+        dict with stats:
+            - total_tokens: number of tokens
+            - file_size_bytes: size of the saved file
+            - max_token_id: maximum token ID (to verify dtype is sufficient)
+    """
+    import numpy as np
+    
+    if special_tokens is None:
+        special_tokens = ["<|endoftext|>"]
+    if dtype is None:
+        dtype = np.uint16
+    
+    print(f"Loading tokenizer from {vocab_path} and {merges_path}...")
+    tokenizer = Tokenizer.from_files(vocab_path, merges_path, special_tokens)
+    
+    print(f"Tokenizing {dataset_path}...")
+    
+    # Use encode_iterable for memory efficiency on large files
+    all_tokens = []
+    with open(dataset_path, "r") as f:
+        for token_id in tokenizer.encode_iterable(f):
+            all_tokens.append(token_id)
+    
+    print(f"Total tokens: {len(all_tokens)}")
+    
+    max_token_id = max(all_tokens) if all_tokens else 0
+    print(f"Max token ID: {max_token_id}")
+    
+    # Check if dtype can hold the max token ID
+    if dtype == np.uint16 and max_token_id > 65535:
+        print(f"WARNING: Max token ID {max_token_id} exceeds uint16 range. Using uint32.")
+        dtype = np.uint32
+    elif dtype == np.uint8 and max_token_id > 255:
+        print(f"WARNING: Max token ID {max_token_id} exceeds uint8 range. Using uint16.")
+        dtype = np.uint16
+    
+    token_array = np.array(all_tokens, dtype=dtype)
+    np.save(output_path, token_array)
+    
+    file_size = token_array.nbytes
+    print(f"Saved to {output_path}")
+    print(f"Array shape: {token_array.shape}, dtype: {token_array.dtype}")
+    print(f"File size: {file_size:,} bytes ({file_size / 1024 / 1024:.2f} MB)")
+    
+    return {
+        "total_tokens": len(all_tokens),
+        "file_size_bytes": file_size,
+        "max_token_id": max_token_id,
+        "dtype": str(dtype),
+    }
+
+
+def main():
+    """Main function for tokenizing datasets (can be profiled)."""
+    import tracemalloc
+    
+    # Configuration
+    dataset_path = "./data/TinyStoriesV2-GPT4-valid.txt"
+    vocab_path = "vocab.json"
+    merges_path = "merges.txt"
+    output_path = "./TinyStoriesV2-GPT4-valid_tokens.npy"
+    
+    print("=" * 60)
+    print(f"Tokenizing: {dataset_path}")
+    print("=" * 60)
+    
+    tracemalloc.start()
+    
+    stats = tokenize_dataset(
+        dataset_path=dataset_path,
+        vocab_path=vocab_path,
+        merges_path=merges_path,
+        output_path=output_path,
+    )
+    
+    current_mem, peak_mem = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    
+    print(f"\nPeak memory usage (tracemalloc): {peak_mem / 1024 / 1024:.2f} MB")
+
+
+if __name__ == '__main__':
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Tokenize datasets with optional profiling")
+    parser.add_argument("--profile", action="store_true", help="Enable cProfile profiling")
+    parser.add_argument("--profile-output", type=str, default=None, 
+                        help="Save profile stats to file (optional)")
+    args = parser.parse_args()
+    
+    if args.profile:
+        import cProfile
+        import pstats
+        
+        print("Running with cProfile enabled...")
+        print()
+        
+        with cProfile.Profile() as pr:
+            main()
+        
+        print("\n" + "=" * 60)
+        print("PROFILING RESULTS (sorted by total time)")
+        print("=" * 60)
+        
+        stats = pstats.Stats(pr)
+        stats.sort_stats("tottime").print_stats(50)  # Top 50 functions
+        
+        if args.profile_output:
+            with open(args.profile_output, "w") as f:
+                stats_file = pstats.Stats(pr, stream=f)
+                stats_file.sort_stats("tottime").print_stats()
+            print(f"\nFull profile saved to: {args.profile_output}")
     else:
-        print("✗ FAIL: Results differ!")
-        print(f"  encode() length: {len(tokens)}")
-        print(f"  encode_iterable() length: {len(iterable_tokens)}")
-        # Find first difference
-        for i, (a, b) in enumerate(zip(tokens, iterable_tokens)):
-            if a != b:
-                print(f"  First difference at index {i}: {a} vs {b}")
-                break
-    
-    # Test 6: Round-trip (if decode is implemented)
-    print("\n--- Test 6: Round-trip test ---")
-    try:
-        decoded = tokenizer.decode(tokens)
-        if decoded == body:
-            print("✓ PASS: Round-trip successful")
-        else:
-            print("✗ FAIL: Decoded text doesn't match original")
-    except (NotImplementedError, TypeError, AttributeError) as e:
-        print(f"(decode not implemented: {type(e).__name__})")
-    
-    print("\n" + "=" * 60)
-    
+        import time
+        start_time = time.time()
+        main()
+        elapsed_time = time.time() - start_time
+        print(f"Time elapsed: {elapsed_time:.2f} seconds")
