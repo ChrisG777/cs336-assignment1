@@ -2,6 +2,12 @@ data/
 data
 .DS_Store
 myenvironment/
+merges_owt_train.txt
+tiny_train_tokens.npy
+vocab_owt_train.json
+cs336_basics/profile_results.txt
+cs336_basics/tokenizer_profile.txt
+submit_*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
