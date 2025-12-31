@@ -548,8 +548,8 @@ def main():
     tracemalloc.start()
 
     vocab, merges = train_bpe(
-        OWT_validation_set,
-        10000,
+        OWT_train_set,
+        32000,
         special_tokens,
         num_processes=None,  # set to 1/2/4 to reduce RAM; or env BPE_NUM_PROCESSES
         min_count=1,         # try 2 to drop singletons and save lots of RAM
