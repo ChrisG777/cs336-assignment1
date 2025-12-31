@@ -1,5 +1,8 @@
 data/
+data
 .DS_Store
+myenvironment/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
