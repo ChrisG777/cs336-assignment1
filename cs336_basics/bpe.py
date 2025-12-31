@@ -522,25 +522,29 @@ def train_bpe(
 
     return {i: tok for i, tok in enumerate(vocab)}, merges
 
-def main():
+def main(
+    input_file: str,
+    vocab_size: int,
+    vocab_output: str,
+    merges_output: str,
+    special_tokens: list[str] | None = None,
+    num_processes: int | None = None,
+    min_count: int = 1,
+):
     import json
     import tracemalloc
 
-    Tiny_train_set = "./data/TinyStoriesV2-GPT4-train.txt"
-    Tiny_validation_set = "./data/TinyStoriesV2-GPT4-valid.txt"
-    tiny_set = "./data/tiny.txt"
-    OWT_train_set = "./data/owt_train.txt"
-    OWT_validation_set = "./data/owt_valid.txt"
-    special_tokens = ["<|endoftext|>"]
+    if special_tokens is None:
+        special_tokens = ["<|endoftext|>"]
 
     tracemalloc.start()
 
     vocab, merges = train_bpe(
-        Tiny_train_set,
-        10000,
+        input_file,
+        vocab_size,
         special_tokens,
-        num_processes=None,  # set to 1/2/4 to reduce RAM; or env BPE_NUM_PROCESSES
-        min_count=1,         # try 2 to drop singletons and save lots of RAM
+        num_processes=num_processes,
+        min_count=min_count,
     )
 
     current, peak = tracemalloc.get_traced_memory()
@@ -551,27 +555,97 @@ def main():
     print(f"Longest token ({len(longest_token)} bytes): {longest_token}")
 
     vocab_serializable = {str(k): v.hex() for k, v in vocab.items()}
-    with open("vocab_OWT.json", "w") as f:
+    with open(vocab_output, "w") as f:
         json.dump(vocab_serializable, f, indent=2)
 
-    with open("merges_OWT.txt", "w") as f:
+    with open(merges_output, "w") as f:
         for b1, b2 in merges:
             f.write(f"{b1.hex()} {b2.hex()}\n")
 
-    print(f"Saved vocab ({len(vocab)} tokens) to vocab_OWT.json")
-    print(f"Saved merges ({len(merges)} merges) to merges_OWT.txt")
+    print(f"Saved vocab ({len(vocab)} tokens) to {vocab_output}")
+    print(f"Saved merges ({len(merges)} merges) to {merges_output}")
 
 
 if __name__ == "__main__":
-    profile = True
-    if profile:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Train a byte-level BPE tokenizer.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "input_file",
+        type=str,
+        help="Path to the training data file",
+    )
+    parser.add_argument(
+        "vocab_size",
+        type=int,
+        help="Target vocabulary size (must be >= 256 + number of special tokens)",
+    )
+    parser.add_argument(
+        "--vocab-output",
+        type=str,
+        default="vocab.json",
+        help="Output path for the vocabulary JSON file",
+    )
+    parser.add_argument(
+        "--merges-output",
+        type=str,
+        default="merges.txt",
+        help="Output path for the merges file",
+    )
+    parser.add_argument(
+        "--special-tokens",
+        type=str,
+        nargs="*",
+        default=["<|endoftext|>"],
+        help="Special tokens to add to the vocabulary",
+    )
+    parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=None,
+        help="Number of processes for parallel pretokenization (default: auto)",
+    )
+    parser.add_argument(
+        "--min-count",
+        type=int,
+        default=1,
+        help="Minimum word count to include in training (use 2+ to save RAM)",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable profiling and print stats at the end",
+    )
+
+    args = parser.parse_args()
+
+    if args.profile:
         import cProfile
         import pstats
 
         with cProfile.Profile() as pr:
-            main()
+            main(
+                input_file=args.input_file,
+                vocab_size=args.vocab_size,
+                vocab_output=args.vocab_output,
+                merges_output=args.merges_output,
+                special_tokens=args.special_tokens,
+                num_processes=args.num_processes,
+                min_count=args.min_count,
+            )
 
         stats = pstats.Stats(pr)
         stats.sort_stats("tottime").print_stats()
     else:
-        main()
+        main(
+            input_file=args.input_file,
+            vocab_size=args.vocab_size,
+            vocab_output=args.vocab_output,
+            merges_output=args.merges_output,
+            special_tokens=args.special_tokens,
+            num_processes=args.num_processes,
+            min_count=args.min_count,
+        )
