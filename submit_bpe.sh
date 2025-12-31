@@ -19,4 +19,4 @@ cd ~/cs336-assignment1/
 export BPE_NUM_PROCESSES=$SLURM_CPUS_PER_TASK
 
 # Run module from the root
-python -m cs336_basics.bpe ./data/owt-valid.txt 10000 --vocab-output vocab_owt_valid.json --merges-output merges_owt_valid.txt 
+python -m cs336_basics.bpe ./data/owt_valid.txt 10000 --vocab-output vocab_owt_valid.json --merges-output merges_owt_valid.txt 
