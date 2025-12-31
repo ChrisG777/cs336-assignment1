@@ -7,10 +7,30 @@ import regex as re
 from collections import Counter, defaultdict
 from array import array
 
-from .pretokenization_example import find_chunk_boundaries
+try:
+    # Your scaffold helper; kept for drop-in compatibility
+    from .pretokenization_example import find_chunk_boundaries  # type: ignore
+except Exception:  # pragma: no cover
+    def find_chunk_boundaries(f, num_chunks: int, delimiter: bytes) -> list[int]:
+        """
+        Fallback if the scaffold helper isn't available.
+        WARNING: This may split in the middle of UTF-8 sequences.
+        """
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        if num_chunks <= 1 or size == 0:
+            return [0, size]
+        step = size // num_chunks
+        bounds = [0]
+        for i in range(1, num_chunks):
+            bounds.append(i * step)
+        bounds.append(size)
+        return bounds
+
 
 # --------------------------------------------------------------------------------------
-# Ordering helper for deterministic tie-breaks
+# Deterministic tie-break: prefer lexicographically GREATER (bytes_1, bytes_2) on ties.
+# Implemented via a key where larger bytes => smaller key (so heapq pops it first).
 # --------------------------------------------------------------------------------------
 
 _INV_TABLE = bytes.maketrans(bytes(range(256)), bytes(range(255, -1, -1)))
@@ -18,8 +38,8 @@ _INV_TABLE = bytes.maketrans(bytes(range(256)), bytes(range(255, -1, -1)))
 
 def revlex_key(b: bytes) -> bytes:
     """
-    Key with the property:
-        a > b   <=>   revlex_key(a) < revlex_key(b)
+    Map b -> key such that:
+        (a > b)  <=>  (revlex_key(a) < revlex_key(b))
     using normal bytes comparison.
 
     The 0x00 interleaving + 0xFF terminator fixes the prefix case.
@@ -33,7 +53,7 @@ def revlex_key(b: bytes) -> bytes:
 
 
 # --------------------------------------------------------------------------------------
-# Pair packing (reduce dict/set overhead)
+# Pair packing (reduce dict overhead)
 # --------------------------------------------------------------------------------------
 
 # Must be > bit_length(max_token_id). 20 supports up to ~1M tokens.
@@ -50,10 +70,10 @@ def _unpack_pair(p: int) -> tuple[int, int]:
 
 
 # --------------------------------------------------------------------------------------
-# Pretokenization (optimized: bytes keys, streaming aggregation)
+# Pretokenization (same behavior as your current version; optimized bytes keys)
 # --------------------------------------------------------------------------------------
 
-# GPT-2 regex (as required by the assignment handout)
+# GPT-2 regex (byte-level BPE standard)
 _PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 _PAT_RE = re.compile(_PAT)
 
@@ -111,9 +131,7 @@ def pretokenize_bytes(text: str, special_tokens: list[str]) -> dict[bytes, int]:
 
 
 def pretokenize(text: str, special_tokens: list[str]) -> dict[tuple[int, ...], int]:
-    """
-    Compatibility wrapper: returns dict[tuple[int,...], int] like the original scaffold.
-    """
+    """Compatibility wrapper: dict[tuple[int,...], int] like original scaffold."""
     counts_b = pretokenize_bytes(text, special_tokens)
     return {tuple(k): v for k, v in counts_b.items()}
 
@@ -133,7 +151,7 @@ def pretokenize_chunk(args: tuple[str, int, int, list[str]]) -> dict[bytes, int]
 
 def _default_num_processes() -> int:
     """
-    A memory-friendlier default than mp.cpu_count().
+    Default parallelism for pretokenization.
 
     Override with env var BPE_NUM_PROCESSES if desired.
     """
@@ -145,9 +163,8 @@ def _default_num_processes() -> int:
                 return n
         except ValueError:
             pass
-    # On large files, spawning N=cpu_count() workers can blow up RAM because each worker
-    # builds a big dict and also pickles it back to the parent.
-    return max(1, min(4, mp.cpu_count()))
+    # Conservative default; on your cluster you likely want to set BPE_NUM_PROCESSES explicitly.
+    return max(1, min(8, mp.cpu_count()))
 
 
 def parallel_pretokenize_bytes(
@@ -163,7 +180,12 @@ def parallel_pretokenize_bytes(
     if num_processes is None:
         num_processes = _default_num_processes()
 
-    # find_chunk_boundaries expects a delimiter bytes pattern.
+    # Fast path: single-process (also avoids needing find_chunk_boundaries).
+    if num_processes <= 1:
+        with open(input_path, "rb") as f:
+            text = f.read().decode("utf-8", errors="ignore")
+        return pretokenize_bytes(text, special_tokens)
+
     delimiter = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
 
     with open(input_path, "rb") as f:
@@ -176,17 +198,9 @@ def parallel_pretokenize_bytes(
     ]
 
     total = Counter()
-
-    # Fast path for 1 process (saves mp overhead + avoids pickling large dicts).
-    if num_processes == 1:
-        for wi in work_items:
-            total.update(pretokenize_chunk(wi))
-        return dict(total)
-
     with mp.Pool(num_processes) as pool:
         for part in pool.imap_unordered(pretokenize_chunk, work_items, chunksize=1):
             total.update(part)
-
     return dict(total)
 
 
@@ -195,85 +209,18 @@ def parallel_pretokenize(
     special_tokens: list[str],
     num_processes: int | None = None,
 ) -> dict[tuple[int, ...], int]:
-    """
-    Backwards-compatible wrapper returning dict[tuple[int,...],int].
-    """
+    """Backwards-compatible wrapper returning dict[tuple[int,...],int]."""
     counts_b = parallel_pretokenize_bytes(input_path, special_tokens, num_processes=num_processes)
     return {tuple(k): v for k, v in counts_b.items()}
 
 
 # --------------------------------------------------------------------------------------
-# Word encoding helpers (major memory win vs tuple[int,...])
+# BPE training (major rewrite): exact pair occurrences + local neighbor updates
 # --------------------------------------------------------------------------------------
 
-def _choose_word_format(target_vocab_no_special: int) -> tuple[str, str, int]:
-    """
-    Choose a compact packed representation for word token-id sequences.
+# Sentinel for "null pointer" in the node linked list. Also used for DEAD nodes in sym[].
+_NONE = 0xFFFFFFFF
 
-    Returns (array_typecode, memoryview_format, itemsize_bytes).
-
-    - 'H' (uint16) is enough up to 65535 token ids.
-    - 'I' (uint32) supports larger vocab sizes (still < 2^32).
-    """
-    if target_vocab_no_special <= 0xFFFF:
-        return "H", "H", 2
-    if target_vocab_no_special <= 0xFFFFFFFF:
-        return "I", "I", 4
-    raise ValueError("vocab_size too large for packed word encoding")
-
-
-def _pack_word_from_bytes(wb: bytes, typecode: str) -> bytes:
-    """
-    Convert a byte string (sequence of initial token ids 0..255) into
-    packed uint16/uint32 bytes so we can store merged token ids compactly.
-    """
-    # IMPORTANT: array(typecode, wb) treats wb as *raw binary*, requiring len(wb)
-    # to be a multiple of itemsize. We want element-wise widening instead.
-    arr = array(typecode)
-    arr.extend(wb)  # bytes iterates as ints 0..255
-    return arr.tobytes()
-
-
-def _transform_word_packed(
-    word: bytes,
-    mv_fmt: str,
-    a: int,
-    b: int,
-    new_token: int,
-    out_typecode: str,
-) -> tuple[bytes, bool]:
-    """
-    Replace occurrences of (a,b) left-to-right in a packed word.
-
-    Returns (new_word, changed_flag).
-    """
-    mv = memoryview(word).cast(mv_fmt)
-    n = len(mv)
-    if n < 2:
-        return word, False
-
-    out = array(out_typecode)
-    append = out.append
-    i = 0
-    changed = False
-
-    while i < n:
-        if i + 1 < n and mv[i] == a and mv[i + 1] == b:
-            append(new_token)
-            i += 2
-            changed = True
-        else:
-            append(mv[i])
-            i += 1
-
-    if not changed:
-        return word, False
-    return out.tobytes(), True
-
-
-# --------------------------------------------------------------------------------------
-# BPE training
-# --------------------------------------------------------------------------------------
 
 def train_bpe(
     input_path: str,
@@ -284,19 +231,19 @@ def train_bpe(
     verbose_every: int = 100,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
-    Train byte-level BPE.
+    Train byte-level BPE with *local neighbor updates*.
 
-    Args:
-      input_path: path to a UTF-8-ish text file
-      vocab_size: total vocab size INCLUDING special tokens
-      special_tokens: list of specials to append at the end
-      num_processes: worker processes for pretokenization (lower -> less RAM)
-      min_count: drop pre-tokens with corpus frequency < min_count (saves lots of RAM; set 1 for exact)
-      verbose_every: print progress every N merges (0 disables)
+    Drop-in replacement:
+      - Same signature and return types.
+      - Same GPT-2 regex pretokenization (no merges across pretoken boundaries).
+      - Same deterministic tie-break: if counts tie, merge the lexicographically greatest pair.
 
-    Returns:
-      vocab: dict[token_id -> token_bytes]
-      merges: list[(bytes_1, bytes_2)] in merge order
+    Core speed idea:
+      Maintain exact occurrences per pair (a,b). When merging (a,b)->c at a site,
+      only pairs touching that site can change:
+          (p,a), (a,b), (b,n)  disappear
+          (p,c), (c,n)         appear
+      We update only those counts and append only those new occurrences.
     """
     # --- 1) Pretokenize (bytes keys) ---
     word_counts_b: dict[bytes, int] = parallel_pretokenize_bytes(
@@ -311,216 +258,259 @@ def train_bpe(
 
     # Safety for packed pair keys
     if target_vocab_no_special - 1 >= (1 << _SHIFT):
-        raise ValueError(f"vocab_size={vocab_size} exceeds packed-pair capacity; increase _SHIFT.")
+        raise ValueError(
+            f"vocab_size={vocab_size} exceeds packed-pair capacity; increase _SHIFT."
+        )
 
-    word_typecode, mv_fmt, itemsize = _choose_word_format(target_vocab_no_special)
-
-    # --- 2) Convert pretokenized bytes -> packed word bytes in ONE pass (lower peak RAM) ---
-    words: list[bytes | None] = []
-    counts = array("Q")  # uint64 counts
-    word_to_id: dict[bytes, int] = {}
-
-    for wb, c in word_counts_b.items():
-        if c < min_count:
-            continue
-        w = _pack_word_from_bytes(wb, word_typecode)
-        wid = len(words)
-        words.append(w)
-        counts.append(c)
-        word_to_id[w] = wid
-
-    # free the big pretoken dict
-    del word_counts_b
-
-    # --- 3) Vocab + tie-break keys (dense ids) ---
+    # --- 2) Vocab (dense ids) + tie-break keys ---
     vocab: list[bytes] = [bytes([i]) for i in range(256)]
     vocab_key: list[bytes] = [revlex_key(tok) for tok in vocab]
     merges: list[tuple[bytes, bytes]] = []
 
-    # --- 4) pair_counts and pair_to_words ---
-    pair_counts: dict[int, int] = defaultdict(int)  # pk -> total frequency
-    # pk -> array('I') of word ids that contain pk at least once.
-    # NOTE: we never remove individual ids; deactivated words are skipped by counts[wid]==0.
-    pair_to_words: dict[int, array] = {}
+    # --- 3) Build word graphs + initial pair stats ---
+    # Word representation:
+    #   global node arrays sym/nxt/prv (linked list per word)
+    #   head[wid] is the first node of word wid
+    #   wcount[wid] is the word frequency
+    sym = array("I")
+    nxt = array("I")
+    prv = array("I")
+    head = array("I")
+    wcount = array("Q")
 
-    for wid, w in enumerate(words):
-        c = counts[wid]
-        if c == 0 or w is None or len(w) < 2 * itemsize:
+    # Pair stats:
+    #   pair_counts[pk] = total weighted count
+    #   pair_occ[pk] = array('Q') of packed occurrences (wid<<32 | start_node)
+    pair_counts: defaultdict[int, int] = defaultdict(int)
+    pair_occ: dict[int, array] = {}
+
+    pack_pair = _pack_pair
+    pair_occ_get = pair_occ.get
+
+    for wb, c in word_counts_b.items():
+        if c < min_count:
             continue
 
-        mv = memoryview(w).cast(mv_fmt)
-        n = len(mv)
-        if n < 2:
+        wid = len(head)
+        start = len(sym)
+        L = len(wb)
+
+        if L == 0:
+            head.append(_NONE)
+            wcount.append(0)
             continue
 
-        prev = mv[0]
-        seen_pairs: set[int] = set()
-        for i in range(1, n):
-            tok = mv[i]
-            pk = _pack_pair(prev, tok)
-            pair_counts[pk] += c
+        sym.extend(wb)  # bytes -> ints
 
-            if pk not in seen_pairs:
-                arr = pair_to_words.get(pk)
+        # prev pointers: [_NONE, start, start+1, ...]
+        prv.append(_NONE)
+        if L > 1:
+            prv.extend(range(start, start + L - 1))
+
+        # next pointers: [start+1, start+2, ..., _NONE]
+        if L > 1:
+            nxt.extend(range(start + 1, start + L))
+        nxt.append(_NONE)
+
+        head.append(start)
+        wcount.append(c)
+
+        # initial pairs + occurrences
+        if L > 1:
+            for off in range(L - 1):
+                a = wb[off]
+                b = wb[off + 1]
+                pk = pack_pair(a, b)
+                pair_counts[pk] += c
+                arr = pair_occ_get(pk)
                 if arr is None:
-                    arr = array("I")
-                    pair_to_words[pk] = arr
-                arr.append(wid)
-                seen_pairs.add(pk)
+                    arr = array("Q")
+                    pair_occ[pk] = arr
+                arr.append((wid << 32) | (start + off))
 
-            prev = tok
+    del word_counts_b  # reduce peak RAM
 
-    # --- 5) Heap with entry_finder + periodic rebuild ---
+    # --- 4) Heap with lazy deletion (tie-break matches your old code) ---
     heap: list[tuple[int, bytes, bytes, int]] = []
     entry_finder: dict[int, tuple[int, bytes, bytes, int]] = {}
+
+    for pk, c in pair_counts.items():
+        if c <= 0:
+            continue
+        a, b = _unpack_pair(pk)
+        entry = (-c, vocab_key[a], vocab_key[b], pk)
+        heap.append(entry)
+        entry_finder[pk] = entry
+    heapq.heapify(heap)
 
     heappush = heapq.heappush
     heappop = heapq.heappop
     heapify = heapq.heapify
 
     def heap_set(pk: int, c: int) -> None:
-        """Set/update the heap priority for pk to count c (must be >0)."""
         a, b = _unpack_pair(pk)
         entry = (-c, vocab_key[a], vocab_key[b], pk)
         entry_finder[pk] = entry
         heappush(heap, entry)
 
-    for pk, c in pair_counts.items():
-        if c > 0:
-            heap_set(pk, c)
-
-    def heap_pop_best() -> tuple[int, int]:
-        """Return (pair_key, count) for the current max pair."""
+    def heap_pop_best() -> int:
         while heap:
             entry = heappop(heap)
             pk = entry[3]
             if entry_finder.get(pk) is entry:
                 del entry_finder[pk]
-                return pk, -entry[0]
+                return pk
         raise ValueError("No pairs left to merge (corpus too small for requested vocab_size).")
 
     def maybe_rebuild_heap() -> None:
-        # If heap is mostly stale, rebuild from entry_finder values.
         if len(heap) > 4 * len(entry_finder) + 200_000:
             heap[:] = list(entry_finder.values())
             heapify(heap)
 
-    # --- 6) Helpers to update pair_counts + pair_to_words for new words ---
-    def adjust_pair_counts(seq: bytes | None, delta: int, touched: set[int], skip_pk: int) -> None:
-        if seq is None or len(seq) < 2 * itemsize:
-            return
-        mv = memoryview(seq).cast(mv_fmt)
-        n = len(mv)
-        if n < 2:
-            return
-        prev = mv[0]
-        for i in range(1, n):
-            tok = mv[i]
-            pk = _pack_pair(prev, tok)
-            if pk != skip_pk:
-                pair_counts[pk] += delta
-                touched.add(pk)
-            prev = tok
+    # --- 5) Merge loop: local neighbor updates only ---
+    sym_a = sym
+    nxt_a = nxt
+    prv_a = prv
+    head_a = head
+    wcount_a = wcount
+    pair_counts_a = pair_counts
+    pair_occ_a = pair_occ
 
-    def add_word_to_pairs(wid: int, seq: bytes, skip_pk: int) -> None:
-        """Add wid to pair_to_words for each unique pair in seq."""
-        if len(seq) < 2 * itemsize:
-            return
-        mv = memoryview(seq).cast(mv_fmt)
-        n = len(mv)
-        if n < 2:
-            return
-        prev = mv[0]
-        seen: set[int] = set()
-        for i in range(1, n):
-            tok = mv[i]
-            pk = _pack_pair(prev, tok)
-            if pk != skip_pk and pk not in seen:
-                arr = pair_to_words.get(pk)
-                if arr is None:
-                    arr = array("I")
-                    pair_to_words[pk] = arr
-                arr.append(wid)
-                seen.add(pk)
-            prev = tok
-
-    # --- 7) Merge loop ---
-    total_merges = target_vocab_no_special - len(vocab)
     touched: set[int] = set()
+    touched_add = touched.add
 
+    def add_occ(pk: int, wid: int, node: int) -> None:
+        arr = pair_occ_a.get(pk)
+        if arr is None:
+            arr = array("Q")
+            pair_occ_a[pk] = arr
+        arr.append((wid << 32) | node)
+
+    def merge_at(wid: int, i: int, best_pk: int, a_id: int, b_id: int, new_id: int) -> None:
+        wc = wcount_a[wid]
+        j = nxt_a[i]         # node with b_id
+        p = prv_a[i]         # prev node
+        n = nxt_a[j]         # next node after j
+
+        # Remove (p,a)
+        if p != _NONE:
+            pk = pack_pair(sym_a[p], a_id)
+            if pk != best_pk:
+                pair_counts_a[pk] -= wc
+                touched_add(pk)
+
+        # Remove (b,n) (starts at j)
+        if n != _NONE:
+            pk = pack_pair(b_id, sym_a[n])
+            if pk != best_pk:
+                pair_counts_a[pk] -= wc
+                touched_add(pk)
+
+        # Apply merge: i becomes new_id, delete j
+        sym_a[i] = new_id
+        nxt_a[i] = n
+        if n != _NONE:
+            prv_a[n] = i
+
+        sym_a[j] = _NONE
+        nxt_a[j] = _NONE
+        prv_a[j] = _NONE
+
+        # Add (p,new) (starts at p)
+        if p != _NONE:
+            pk = pack_pair(sym_a[p], new_id)
+            pair_counts_a[pk] += wc
+            touched_add(pk)
+            add_occ(pk, wid, p)
+
+        # Add (new,n) (starts at i)
+        if n != _NONE:
+            pk = pack_pair(new_id, sym_a[n])
+            pair_counts_a[pk] += wc
+            touched_add(pk)
+            add_occ(pk, wid, i)
+
+    # Self-pair merge requires left-to-right to avoid overlap (a==b).
+    word_seen: bytearray | None = None
+    affected_words: list[int] = []
+
+    total_merges = target_vocab_no_special - 256
     for merge_i in range(total_merges):
         if verbose_every and (merge_i + 1) % verbose_every == 0:
             print(f"Doing merge {merge_i + 1} out of {total_merges}")
 
-        best_pk, _best_count = heap_pop_best()
+        best_pk = heap_pop_best()
 
-        affected = pair_to_words.pop(best_pk, None)
-        if not affected:
+        occs = pair_occ_a.pop(best_pk, None)
+        if not occs:
             # stale heap entry
-            pair_counts.pop(best_pk, None)
+            pair_counts_a.pop(best_pk, None)
             maybe_rebuild_heap()
             continue
 
-        a, b = _unpack_pair(best_pk)
-        bytes_1 = vocab[a]
-        bytes_2 = vocab[b]
+        a_id, b_id = _unpack_pair(best_pk)
 
-        new_token = len(vocab)
-        new_bytes = bytes_1 + bytes_2
+        # New token
+        new_id = len(vocab)
+        new_bytes = vocab[a_id] + vocab[b_id]
         vocab.append(new_bytes)
         vocab_key.append(revlex_key(new_bytes))
-        merges.append((bytes_1, bytes_2))
+        merges.append((vocab[a_id], vocab[b_id]))
 
         touched.clear()
 
-        for wid in affected:
-            wcount = counts[wid]
-            if wcount == 0:
-                continue  # deactivated word id
+        # best_pk will never be merged again; drop its count entry (and we skip updating it)
+        pair_counts_a.pop(best_pk, None)
 
-            old_word = words[wid]
-            if old_word is None:
-                continue
+        if a_id == b_id:
+            if word_seen is None:
+                word_seen = bytearray(len(head_a))
 
-            new_word, changed = _transform_word_packed(
-                old_word, mv_fmt, a, b, new_token, word_typecode
-            )
-            if not changed:
-                continue
+            affected_words.clear()
+            for occ in occs:
+                wid = occ >> 32
+                if not word_seen[wid]:
+                    word_seen[wid] = 1
+                    affected_words.append(wid)
 
-            new_id = word_to_id.get(new_word)
-            created = False
-            if new_id is None:
-                new_id = len(words)
-                word_to_id[new_word] = new_id
-                words.append(new_word)
-                counts.append(0)
-                created = True
+            for wid in affected_words:
+                i = head_a[wid]
+                if i == _NONE:
+                    continue
+                while True:
+                    j = nxt_a[i]
+                    if j == _NONE:
+                        break
+                    if sym_a[i] == a_id and sym_a[j] == b_id:
+                        merge_at(wid, i, best_pk, a_id, b_id, new_id)
+                        i = nxt_a[i]
+                        if i == _NONE:
+                            break
+                    else:
+                        i = j
 
-            counts[new_id] += wcount
+            for wid in affected_words:
+                word_seen[wid] = 0
 
-            # Deactivate old
-            counts[wid] = 0
-            words[wid] = None
-            word_to_id.pop(old_word, None)
+        else:
+            for occ in occs:
+                wid = occ >> 32
+                i = occ & 0xFFFFFFFF
 
-            # Update global pair_counts
-            adjust_pair_counts(old_word, -wcount, touched, best_pk)
-            adjust_pair_counts(new_word, +wcount, touched, best_pk)
+                if sym_a[i] != a_id:
+                    continue
+                j = nxt_a[i]
+                if j == _NONE or sym_a[j] != b_id:
+                    continue
+                merge_at(wid, i, best_pk, a_id, b_id, new_id)
 
-            if created:
-                add_word_to_pairs(new_id, new_word, best_pk)
-
-        # best pair is now dead
-        pair_counts.pop(best_pk, None)
-        entry_finder.pop(best_pk, None)
-
+        # Heap updates for touched pairs only
         for pk in touched:
-            c = pair_counts.get(pk, 0)
+            c = pair_counts_a[pk]
             if c <= 0:
-                pair_counts.pop(pk, None)
+                pair_counts_a.pop(pk, None)
                 entry_finder.pop(pk, None)
-                pair_to_words.pop(pk, None)
+                pair_occ_a.pop(pk, None)
             else:
                 heap_set(pk, c)
 
@@ -530,9 +520,7 @@ def train_bpe(
     for st in special_tokens:
         vocab.append(st.encode("utf-8"))
 
-    vocab_dict = {i: tok for i, tok in enumerate(vocab)}
-    return vocab_dict, merges
-
+    return {i: tok for i, tok in enumerate(vocab)}, merges
 
 def main():
     import json
@@ -548,8 +536,8 @@ def main():
     tracemalloc.start()
 
     vocab, merges = train_bpe(
-        OWT_train_set,
-        32000,
+        Tiny_train_set,
+        10000,
         special_tokens,
         num_processes=None,  # set to 1/2/4 to reduce RAM; or env BPE_NUM_PROCESSES
         min_count=1,         # try 2 to drop singletons and save lots of RAM
@@ -575,7 +563,7 @@ def main():
 
 
 if __name__ == "__main__":
-    profile = False
+    profile = True
     if profile:
         import cProfile
         import pstats
