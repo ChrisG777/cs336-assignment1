@@ -1,10 +1,35 @@
+### ChatGPT optimized version
+### last human commit for this file was 9d6c0af8fd7e48bdbc58374104ae5f038e836066
+
 import json
+import heapq
 from typing import Iterable, Iterator
 import regex as re
 
+# --------------------------------------------------------------------------------------
+# Pair packing for dict keys (faster + smaller than tuple[int,int])
+# --------------------------------------------------------------------------------------
+
+# Must be > bit_length(max_token_id). 20 supports up to ~1M tokens.
+_SHIFT = 20
+_MASK = (1 << _SHIFT) - 1
+
+
+def _pack_pair(a: int, b: int) -> int:
+    return (a << _SHIFT) | b
+
+
+# --------------------------------------------------------------------------------------
+# Tokenizer
+# --------------------------------------------------------------------------------------
+
 
 class Tokenizer:
+    # GPT-2 regex (as in the handout)
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    # For short “words”, repeated linear scans beat heap overhead.
+    _SMALL_WORD_MAX = 64
 
     def __init__(
         self,
@@ -12,61 +37,109 @@ class Tokenizer:
         merges: list[tuple[bytes, bytes]],
         special_tokens: list[str] | None = None,
     ):
-        # --- vocab / ids ---
-        self.vocab = vocab
+        # Keep a private copy (don’t mutate caller’s dict)
+        self.vocab: dict[int, bytes] = dict(vocab)
+        self.merges: list[tuple[bytes, bytes]] = list(merges)
 
-        # (Optional) ensure special tokens are in vocab
-        if special_tokens:
-            # Avoid O(|vocab|) "x in vocab.values()" for every special token
-            values_set = set(self.vocab.values())
-            for tok in special_tokens:
-                b = tok.encode("utf-8")
-                if b not in values_set:
-                    self.vocab[len(self.vocab)] = b
-                    values_set.add(b)
-
-        self.vocab_index = {b: idx for idx, b in self.vocab.items()}
-
-        # --- merges ---
-        self.merges = merges
-        self.merges_index = {(b1, b2): i for i, (b1, b2) in enumerate(merges)}
-
-        # --- cache ---
+        # Cache for encode_word (keyed by pretoken string)
         self.cache: dict[str, list[int]] = {}
 
-        # --- regex precompile (big speed win) ---
+        # -----------------------------
+        # Build token <-> id mappings
+        # -----------------------------
+        token_to_id: dict[bytes, int] = {tok: tid for tid, tok in self.vocab.items()}
+
+        self.special_tokens: list[str] = list(special_tokens) if special_tokens else []
+
+        # Ensure special tokens exist in vocab (append if missing)
+        if self.special_tokens:
+            max_id = max(self.vocab) if self.vocab else -1
+            for tok in self.special_tokens:
+                tb = tok.encode("utf-8")
+                if tb not in token_to_id:
+                    max_id += 1
+                    self.vocab[max_id] = tb
+                    token_to_id[tb] = max_id
+
+        self._token_to_id = token_to_id
+
+        # Build dense id->bytes table (supports non-0..N-1 ids too)
+        max_id = max(self.vocab) if self.vocab else -1
+        id_to_token = [b""] * (max_id + 1)
+        for tid, tok in self.vocab.items():
+            id_to_token[tid] = tok
+        self._id_to_token = id_to_token
+
+        # ---------------------------------------------------------
+        # CRITICAL FIX:
+        # Precompute byte_value -> token_id from vocab (NOT identity)
+        # ---------------------------------------------------------
+        byte_to_id = [0] * 256
+        for b in range(256):
+            tid = token_to_id.get(bytes([b]))
+            if tid is None:
+                raise ValueError(f"Vocab missing single-byte token for byte {b}.")
+            byte_to_id[b] = tid
+        self._byte_to_id = byte_to_id
+
+        # ------------------------------------------
+        # Precompute merges in *ID space* for speed
+        # ------------------------------------------
+        pair_rank: dict[int, int] = {}
+        new_id_by_rank: list[int] = []
+
+        # rank is merge order (0 is highest priority)
+        for rank, (b1, b2) in enumerate(self.merges):
+            a = token_to_id[b1]
+            b = token_to_id[b2]
+            pair_rank[_pack_pair(a, b)] = rank
+
+            merged_bytes = b1 + b2
+            new_id = token_to_id.get(merged_bytes)
+            if new_id is None:
+                # This should not happen if vocab/merges are consistent (GPT-2 or your trainer output).
+                raise ValueError(f"Merge creates token {merged_bytes!r} that is not present in vocab.")
+            new_id_by_rank.append(new_id)
+
+        self._pair_rank = pair_rank
+        self._new_id_by_rank = new_id_by_rank
+
+        # Regex precompile
         self._pat = re.compile(self.PAT)
 
-        # --- special token handling ---
-        self.special_tokens = special_tokens or []
+        # ------------------------------------------
+        # Special token handling (fast paths)
+        # ------------------------------------------
         if self.special_tokens:
-            # Longer-first avoids prefix issues if overlapping specials exist.
-            key = tuple(sorted(self.special_tokens, key=len, reverse=True))
-            self.special_tokens = list(key)
+            # Longer-first prevents overlapping-prefix bugs
+            self.special_tokens.sort(key=len, reverse=True)
 
             self._special_to_id: dict[str, int] = {
-                tok: self.vocab_index[tok.encode("utf-8")] for tok in self.special_tokens
+                tok: token_to_id[tok.encode("utf-8")] for tok in self.special_tokens
             }
 
             if len(self.special_tokens) == 1:
-                # Hot-path: single special token (e.g. "<|endoftext|>") -> use str.split
+                # Single special token hot path: use str.find / str.split
                 self._single_special = self.special_tokens[0]
                 self._single_special_id = self._special_to_id[self._single_special]
                 self._special_re = None
+                self._max_special_len = len(self._single_special)
             else:
-                self._single_special = None
-                self._single_special_id = None
                 pat = "(" + "|".join(re.escape(tok) for tok in self.special_tokens) + ")"
                 self._special_re = re.compile(pat)
+                self._single_special = None
+                self._single_special_id = None
+                self._max_special_len = max(len(t) for t in self.special_tokens)
         else:
             self._special_to_id = {}
             self._single_special = None
             self._single_special_id = None
             self._special_re = None
+            self._max_special_len = 0
 
-        # Optional micro-opt for cache-miss path: reuse 1-byte objects
-        self._byte_tokens = [bytes([i]) for i in range(256)]
-
+    # -----------------------------
+    # IO helpers
+    # -----------------------------
     @classmethod
     def from_files(
         cls,
@@ -76,7 +149,6 @@ class Tokenizer:
     ):
         with open(vocab_filepath, "r") as f:
             vocab_serialized = json.load(f)
-
         vocab = {int(k): bytes.fromhex(v) for k, v in vocab_serialized.items()}
 
         merges: list[tuple[bytes, bytes]] = []
@@ -90,17 +162,17 @@ class Tokenizer:
 
         return cls(vocab, merges, special_tokens or [])
 
+    # -----------------------------
+    # Public API
+    # -----------------------------
+    def decode(self, ids: list[int]) -> str:
+        b = b"".join(self._id_to_token[i] for i in ids)
+        return b.decode("utf-8", errors="replace")
+
     def encode(self, text: str) -> list[int]:
-        """
-        Faster encode:
-          - uses precompiled regex
-          - uses findall() (avoids millions of match.group() calls)
-          - uses a dict lookup for special tokens
-          - fast-path for single special token via str.split
-        """
         out: list[int] = []
-        out_append = out.append
         out_extend = out.extend
+        out_append = out.append
 
         pat_findall = self._pat.findall
         encode_word = self.encode_word
@@ -113,7 +185,7 @@ class Tokenizer:
         # Single special token fast path
         if self._single_special is not None:
             special = self._single_special
-            special_id = self._single_special_id
+            sid = self._single_special_id
 
             parts = text.split(special)
             last = len(parts) - 1
@@ -122,19 +194,18 @@ class Tokenizer:
                     for piece in pat_findall(part):
                         out_extend(encode_word(piece))
                 if i != last:
-                    out_append(special_id)
+                    out_append(sid)
             return out
 
-        # Multiple special tokens path
-        special_split = self._special_re.split  # type: ignore[union-attr]
+        # Multiple special tokens
+        split = self._special_re.split  # type: ignore[union-attr]
         special_to_id = self._special_to_id
-
-        for part in special_split(text):
+        for part in split(text):
             if not part:
                 continue
-            tok_id = special_to_id.get(part)
-            if tok_id is not None:
-                out_append(tok_id)
+            sid = special_to_id.get(part)
+            if sid is not None:
+                out_append(sid)
             else:
                 for piece in pat_findall(part):
                     out_extend(encode_word(piece))
@@ -142,118 +213,259 @@ class Tokenizer:
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         """
-        Much simpler + faster than your current version.
+        Streaming encoder that matches `encode("".join(iterable))` exactly, while keeping memory bounded.
 
-        Under your stated assumption (“special tokens don’t span lines”), we do NOT need
-        the complicated buffer/match-end logic. That logic was costing you a lot.
+        Why this is non-trivial:
+          - The GPT-2 regex can tokenize trailing whitespace differently at end-of-string.
+          - Special tokens must be treated as hard boundaries.
+          - Chunks may split inside a regex-token or a special token.
 
-        Still yields ints one-by-one (same API).
+        This implementation keeps small buffers to ensure correctness.
         """
-        pat_findall = self._pat.findall
         encode_word = self.encode_word
+        pat_finditer = self._pat.finditer
 
-        # No special tokens
+        # -----------------------------
+        # Helper: stream regex pretokenization with a carry buffer
+        # -----------------------------
+        pbuf = ""
+
+        def feed_pbuf(s: str, *, final: bool) -> Iterator[int]:
+            nonlocal pbuf
+            if not s and (not final or not pbuf):
+                return
+            pbuf = pbuf + s
+            if not pbuf:
+                return
+
+            last_start = None
+            for m in pat_finditer(pbuf):
+                end = m.end()
+                # If the match reaches the end and we're not at a hard boundary, defer it.
+                if (not final) and end == len(pbuf):
+                    last_start = m.start()
+                    break
+                for tid in encode_word(m.group(0)):
+                    yield tid
+
+            if last_start is None:
+                pbuf = ""
+            else:
+                pbuf = pbuf[last_start:]
+
+        # -----------------------------
+        # No special tokens: just regex streaming
+        # -----------------------------
         if not self.special_tokens:
             for chunk in iterable:
-                for piece in pat_findall(chunk):
-                    yield from encode_word(piece)
+                if chunk:
+                    yield from feed_pbuf(chunk, final=False)
+            if pbuf:
+                yield from feed_pbuf("", final=True)
             return
 
-        # Single special token fast path
+        # -----------------------------
+        # With special tokens: stream-scan for specials, flush regex buffer at boundaries
+        # -----------------------------
+        sbuf = ""
+        max_keep = max(0, self._max_special_len - 1)
+
+        # Single special fast path: str.find
         if self._single_special is not None:
             special = self._single_special
-            special_id = self._single_special_id
+            sid = self._single_special_id
 
             for chunk in iterable:
-                if special not in chunk:
-                    for piece in pat_findall(chunk):
-                        yield from encode_word(piece)
+                if not chunk:
                     continue
+                sbuf += chunk
 
-                parts = chunk.split(special)
-                last = len(parts) - 1
-                for i, part in enumerate(parts):
-                    if part:
-                        for piece in pat_findall(part):
-                            yield from encode_word(piece)
-                    if i != last:
-                        yield special_id
+                while True:
+                    idx = sbuf.find(special)
+                    if idx == -1:
+                        break
+
+                    # Text before special is a segment boundary -> flush regex buffer
+                    if idx:
+                        yield from feed_pbuf(sbuf[:idx], final=True)
+                    else:
+                        if pbuf:
+                            yield from feed_pbuf("", final=True)
+
+                    yield sid
+                    sbuf = sbuf[idx + len(special) :]
+
+                # Emit a safe prefix that cannot start a special token
+                if max_keep and len(sbuf) > max_keep:
+                    safe_end = len(sbuf) - max_keep
+                    yield from feed_pbuf(sbuf[:safe_end], final=False)
+                    sbuf = sbuf[safe_end:]
+
+            # End-of-stream flush
+            if sbuf:
+                yield from feed_pbuf(sbuf, final=True)
+            elif pbuf:
+                yield from feed_pbuf("", final=True)
             return
 
-        # Multiple special tokens
-        special_split = self._special_re.split  # type: ignore[union-attr]
+        # Multiple specials: regex search
+        special_re = self._special_re  # type: ignore[assignment]
         special_to_id = self._special_to_id
+
         for chunk in iterable:
-            for part in special_split(chunk):
-                if not part:
-                    continue
-                tok_id = special_to_id.get(part)
-                if tok_id is not None:
-                    yield tok_id
+            if not chunk:
+                continue
+            sbuf += chunk
+
+            while True:
+                m = special_re.search(sbuf)
+                if m is None:
+                    break
+
+                start, end = m.span()
+
+                if start:
+                    yield from feed_pbuf(sbuf[:start], final=True)
                 else:
-                    for piece in pat_findall(part):
-                        yield from encode_word(piece)
+                    if pbuf:
+                        yield from feed_pbuf("", final=True)
 
-    def decode(self, ids: list[int]) -> str:
-        b = b"".join(self.vocab[i] for i in ids)
-        return b.decode("utf-8", errors="replace")
+                yield special_to_id[m.group(0)]
+                sbuf = sbuf[end:]
 
+            if max_keep and len(sbuf) > max_keep:
+                safe_end = len(sbuf) - max_keep
+                yield from feed_pbuf(sbuf[:safe_end], final=False)
+                sbuf = sbuf[safe_end:]
+
+        # Final flush
+        if sbuf:
+            yield from feed_pbuf(sbuf, final=True)
+        elif pbuf:
+            yield from feed_pbuf("", final=True)
+
+    # -----------------------------
+    # Core: BPE encode a single pre-token "word"
+    # -----------------------------
     def encode_word(self, text: str) -> list[int]:
-        """
-        Your BPE logic, with two small speed tweaks:
-          - cache.get() fast path
-          - reuse singleton 1-byte tokens (avoids tons of tiny bytes allocations on cache misses)
-        """
         cached = self.cache.get(text)
         if cached is not None:
             return cached
 
-        merges_index = self.merges_index
-        vocab_index = self.vocab_index
-        byte_tokens = self._byte_tokens
+        byte_to_id = self._byte_to_id
+        pair_rank = self._pair_rank
+        new_id_by_rank = self._new_id_by_rank
+        pack_pair = _pack_pair
+        INF = 1 << 60
 
-        text_bytes = text.encode("utf-8")
-        current: list[bytes] = [byte_tokens[b] for b in text_bytes]
+        # Start from *byte tokens*, but mapped through vocab -> id (NOT raw 0..255)
+        tb = text.encode("utf-8")
+        ids = [byte_to_id[b] for b in tb]
+        n = len(ids)
 
-        # Repeatedly merge the lowest-rank pair
-        while True:
-            best_rank = 10**18
-            best_pair = None
+        if n < 2:
+            self.cache[text] = ids
+            return ids
 
-            # Scan all adjacent pairs
-            # (Keeping your semantics exactly; if you later want, we can implement a heap-based
-            #  O(n log n) BPE which helps when you have lots of cache misses.)
-            for i in range(len(current) - 1):
-                pair = (current[i], current[i + 1])
-                rank = merges_index.get(pair)
-                if rank is not None and rank < best_rank:
-                    best_rank = rank
-                    best_pair = pair
+        # -----------------------------
+        # Small word: repeated scan
+        # -----------------------------
+        if n <= self._SMALL_WORD_MAX:
+            while True:
+                best_rank = INF
+                best_pk = -1
 
-            if best_pair is None:
-                break
+                prev = ids[0]
+                for j in range(1, len(ids)):
+                    curr = ids[j]
+                    r = pair_rank.get(pack_pair(prev, curr))
+                    if r is not None and r < best_rank:
+                        best_rank = r
+                        best_pk = pack_pair(prev, curr)
+                    prev = curr
 
-            current = _replace_merged_bytes(current, best_pair)
+                if best_rank == INF:
+                    break
 
-        final_tokens = [vocab_index[b] for b in current]
-        self.cache[text] = final_tokens
-        return final_tokens
+                a = best_pk >> _SHIFT
+                b = best_pk & _MASK
+                merged_id = new_id_by_rank[best_rank]
 
+                out: list[int] = []
+                out_append = out.append
 
-def _replace_merged_bytes(seq: list[bytes], pair: tuple[bytes, bytes]) -> list[bytes]:
-    merged = pair[0] + pair[1]
-    out: list[bytes] = []
-    i = 0
-    n = len(seq)
-    a, b = pair
-    while i < n:
-        if i + 1 < n and seq[i] == a and seq[i + 1] == b:
-            out.append(merged)
-            i += 2
-        else:
-            out.append(seq[i])
-            i += 1
-    return out
+                i = 0
+                L = len(ids)
+                while i < L:
+                    if i + 1 < L and ids[i] == a and ids[i + 1] == b:
+                        out_append(merged_id)
+                        i += 2
+                    else:
+                        out_append(ids[i])
+                        i += 1
+
+                ids = out
+                if len(ids) < 2:
+                    break
+
+            self.cache[text] = ids
+            return ids
+
+        # -----------------------------
+        # Long word: heap + linked list
+        # -----------------------------
+        prev = [i - 1 for i in range(n)]
+        nxt = [i + 1 for i in range(n)]
+        nxt[-1] = -1
+
+        heap: list[tuple[int, int]] = []
+        heappush = heapq.heappush
+        heappop = heapq.heappop
+
+        for i in range(n - 1):
+            r = pair_rank.get(pack_pair(ids[i], ids[i + 1]))
+            if r is not None:
+                heappush(heap, (r, i))
+
+        alive = n
+        while heap and alive > 1:
+            r, i = heappop(heap)
+            j = nxt[i]
+            if j == -1:
+                continue
+
+            pk = pack_pair(ids[i], ids[j])
+            if pair_rank.get(pk) != r:
+                continue  # stale heap entry
+
+            # merge i and j into i
+            ids[i] = new_id_by_rank[r]
+
+            k = nxt[j]
+            nxt[i] = k
+            if k != -1:
+                prev[k] = i
+            alive -= 1
+
+            p = prev[i]
+            if p != -1:
+                rr = pair_rank.get(pack_pair(ids[p], ids[i]))
+                if rr is not None:
+                    heappush(heap, (rr, p))
+            if k != -1:
+                rr = pair_rank.get(pack_pair(ids[i], ids[k]))
+                if rr is not None:
+                    heappush(heap, (rr, i))
+
+        out: list[int] = []
+        out_append = out.append
+        i = 0
+        while i != -1:
+            out_append(ids[i])
+            i = nxt[i]
+
+        self.cache[text] = out
+        return out
 
 
 def tokenize_dataset(
