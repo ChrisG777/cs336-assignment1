@@ -8,6 +8,7 @@ vocab_owt_train.json
 cs336_basics/profile_results.txt
 cs336_basics/tokenizer_profile.txt
 submit_*
+owt_train_tokens.npy
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
