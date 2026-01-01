@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+import token
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
@@ -10,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.BPE_tokenizer import train_bpe, Tokenizer
-from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention
+from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention, MHA
 
 
 def run_linear(
@@ -31,7 +32,7 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-    model = Linear(d_in, d_out)
+    model = Linear(d_in, d_out, in_features.device, in_features.dtype)
     state_dict = {"W": weights}
     model.load_state_dict(state_dict)
     return model.forward(in_features)
@@ -83,7 +84,7 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    model = SwiGLU(d_model, d_ff)
+    model = SwiGLU(d_model, d_ff, in_features.device, in_features.dtype)
     # Our Linear class uses 'W' as the parameter name, so state dict keys are w1.W, w2.W, w3.W
     state_dict = {
         "w1.W": w1_weight,
@@ -146,7 +147,15 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mha = MHA(d_model=d_model, num_heads=num_heads, device=in_features.device, dtype=in_features.dtype)
+    state_dict = {
+        "W_Q.W": q_proj_weight,
+        "W_K.W": k_proj_weight, 
+        "W_V.W": v_proj_weight,
+        "W_O.W": o_proj_weight
+    }
+    mha.load_state_dict(state_dict) 
+    return mha.forward(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -186,7 +195,15 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mha = MHA(d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, theta=theta, device=in_features.device, dtype=in_features.dtype)
+    state_dict = {
+        "W_Q.W": q_proj_weight,
+        "W_K.W": k_proj_weight, 
+        "W_V.W": v_proj_weight,
+        "W_O.W": o_proj_weight
+    }
+    mha.load_state_dict(state_dict) 
+    return mha.forward(in_features, token_positions)
 
 
 def run_rope(
@@ -208,7 +225,7 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    rope = RoPE(theta, d_k, max_seq_len)
+    rope = RoPE(theta, d_k, max_seq_len, in_query_or_key.device)
     return rope(in_query_or_key, token_positions)
 
 
@@ -387,7 +404,7 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    rms = RMSNorm(d_model, eps)
+    rms = RMSNorm(d_model, eps, in_features.device, in_features.dtype)
     state_dict = {"weight": weights}
     rms.load_state_dict(state_dict)
     return rms.forward(in_features)

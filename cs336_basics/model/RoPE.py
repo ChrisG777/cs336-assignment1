@@ -24,6 +24,7 @@ class RoPE(nn.Module):
         let a_k be the even positions, b_k be the odd positions
         then R_k [a_k b_k]^T = [a_k cos[k] - b_k sin[k], a_k sin[k] + b_k cos[k]]^T 
         """
+        # self.cos is 
         cos = self.cos[token_positions] # (..., seq_len, d_k/2)
         sin = self.sin[token_positions] # (..., seq_len, d_k/2)
         parity_separated = rearrange(x, "... seq_len (d parity) -> ... seq_len d parity", parity=2)
