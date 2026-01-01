@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.BPE_tokenizer import train_bpe, Tokenizer
-from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention, MHA
+from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention, MHA, Transformer_block
 
 
 def run_linear(
@@ -299,7 +299,23 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    block = Transformer_block(d_model, num_heads, d_ff, max_seq_len, theta, 
+                               device=in_features.device, dtype=in_features.dtype)
+    
+    # Map reference weight names to our implementation's names
+    state_dict = {
+        "ln1.weight": weights["ln1.weight"],
+        "mha.W_Q.W": weights["attn.q_proj.weight"],
+        "mha.W_K.W": weights["attn.k_proj.weight"],
+        "mha.W_V.W": weights["attn.v_proj.weight"],
+        "mha.W_O.W": weights["attn.output_proj.weight"],
+        "ln2.weight": weights["ln2.weight"],
+        "ffn.w1.W": weights["ffn.w1.weight"],
+        "ffn.w2.W": weights["ffn.w2.weight"],
+        "ffn.w3.W": weights["ffn.w3.weight"],
+    }
+    block.load_state_dict(state_dict)
+    return block(in_features)
 
 
 def run_transformer_lm(
