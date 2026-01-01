@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.BPE_tokenizer import train_bpe, Tokenizer
-from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention, MHA, Transformer_block
+from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention, MHA, Transformer_block, Transformer_LM
 
 
 def run_linear(
@@ -397,7 +397,30 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    model = Transformer_LM(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta,
+                           device=in_indices.device)
+    
+    # Map reference weight names to our implementation's names
+    state_dict = {
+        "emb.emb": weights["token_embeddings.weight"],
+        "ln_final.weight": weights["ln_final.weight"],
+        "lm_head.W": weights["lm_head.weight"],
+    }
+    
+    # Map each layer's weights
+    for i in range(num_layers):
+        state_dict[f"blocks.{i}.ln1.weight"] = weights[f"layers.{i}.ln1.weight"]
+        state_dict[f"blocks.{i}.mha.W_Q.W"] = weights[f"layers.{i}.attn.q_proj.weight"]
+        state_dict[f"blocks.{i}.mha.W_K.W"] = weights[f"layers.{i}.attn.k_proj.weight"]
+        state_dict[f"blocks.{i}.mha.W_V.W"] = weights[f"layers.{i}.attn.v_proj.weight"]
+        state_dict[f"blocks.{i}.mha.W_O.W"] = weights[f"layers.{i}.attn.output_proj.weight"]
+        state_dict[f"blocks.{i}.ln2.weight"] = weights[f"layers.{i}.ln2.weight"]
+        state_dict[f"blocks.{i}.ffn.w1.W"] = weights[f"layers.{i}.ffn.w1.weight"]
+        state_dict[f"blocks.{i}.ffn.w2.W"] = weights[f"layers.{i}.ffn.w2.weight"]
+        state_dict[f"blocks.{i}.ffn.w3.W"] = weights[f"layers.{i}.ffn.w3.weight"]
+    
+    model.load_state_dict(state_dict)
+    return model(in_indices)
 
 
 def run_rmsnorm(
