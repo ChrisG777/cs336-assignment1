@@ -12,6 +12,9 @@ class RMSNorm(nn.Module):
         """
         x: (..., d_model) - supports arbitrary leading dimensions
         """
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
         mean_squared = x.pow(2).mean(dim=-1, keepdim=True)
         rms = (mean_squared + self.eps).sqrt()
-        return (x / rms) * self.weight
+        result = (x / rms) * self.weight
+        return result.to(in_dtype)
