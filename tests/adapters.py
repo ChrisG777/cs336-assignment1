@@ -14,6 +14,7 @@ from torch.optim import AdamW
 from cs336_basics.BPE_tokenizer import train_bpe, Tokenizer
 from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention, MHA, Transformer_block, Transformer_LM
 from cs336_basics.optimizer import cross_entropy
+from cs336_basics.optimizer.learning_rate_schedule import get_lr_cosine_schedule
 
 
 def run_linear(
@@ -566,7 +567,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return get_lr_cosine_schedule(it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters) 
 
 
 def run_save_checkpoint(
