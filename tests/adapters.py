@@ -13,7 +13,7 @@ from torch.optim import AdamW
 
 from cs336_basics.BPE_tokenizer import train_bpe, Tokenizer
 from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention, MHA, Transformer_block, Transformer_LM
-from cs336_basics.optimizer import cross_entropy
+from cs336_basics.optimizer import cross_entropy, gradient_clipping
 from cs336_basics.optimizer.learning_rate_schedule import get_lr_cosine_schedule
 
 
@@ -532,7 +532,8 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    return gradient_clipping(parameters, max_l2_norm)
+    
 
 
 def get_adamw_cls() -> Any:
