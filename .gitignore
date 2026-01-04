@@ -9,6 +9,7 @@ cs336_basics/profile_results.txt
 cs336_basics/tokenizer_profile.txt
 submit_*
 tokenized/
+test_checkpoint*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
