@@ -2,7 +2,7 @@
 #SBATCH -p mit_normal_gpu
 #SBATCH -A mit_general
 #SBATCH --gres=gpu:l40s:1
-#SBATCH --time=12:00:00
+#SBATCH --time=6:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name=ts_sweep
