@@ -9,8 +9,8 @@
 #SBATCH --output=logs/eval_owt_%j.out
 #SBATCH --error=logs/eval_owt_%j.err
 
-source myenvironment/bin/activate
 cd ~/cs336-assignment1
+source myenvironment/bin/activate
 
 echo "============================================"
 echo "Evaluating OWT Model on Validation Set"

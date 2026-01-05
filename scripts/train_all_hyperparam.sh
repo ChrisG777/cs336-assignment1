@@ -9,8 +9,8 @@
 #SBATCH --output=logs/ts_sweep_%j.out
 #SBATCH --error=logs/ts_sweep_%j.err
 
-source myenvironment/bin/activate
 cd ~/cs336-assignment1
+source myenvironment/bin/activate
 mkdir -p logs experiments
 
 echo "============================================"

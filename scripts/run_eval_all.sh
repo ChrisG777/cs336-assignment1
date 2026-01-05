@@ -9,8 +9,8 @@
 #SBATCH --output=logs/eval_all_%j.out
 #SBATCH --error=logs/eval_all_%j.err
 
-source myenvironment/bin/activate
 cd ~/cs336-assignment1
+source myenvironment/bin/activate
 
 echo "============================================"
 echo "Evaluating all trained models"
