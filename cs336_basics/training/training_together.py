@@ -2,13 +2,13 @@ import torch
 import numpy as np 
 import os
 import argparse
-import matplotlib.pyplot as plt
 from einops import rearrange 
 from typing import IO, BinaryIO
 from cs336_basics.model import Transformer_LM
 from cs336_basics.optimizer import AdamW, cross_entropy, gradient_clipping, get_lr_cosine_schedule
 from .data_loading import get_batch
 from .checkpointing import save_checkpoint, load_checkpoint
+from .experiment_logging import ExperimentLogger
 
 
 def train(
@@ -37,6 +37,7 @@ def train(
     rope_theta: float,
     eval_interval: int = 100,
     eval_batches: int = 10,
+    exp_name: str = "default_experiment",
 ): 
     """
     warmup_iters, cosine_cycle_iters, max_learning_rate, min_learning_rate are the params for the learning rate scheduler 
@@ -66,6 +67,37 @@ def train(
     if val_dataset is not None:
         print(f"Val dataset: {len(val_dataset):,} tokens")
 
+    # Set up experiment logger
+    log_dir = os.path.join("experiments", exp_name)
+    config = {
+        "exp_name": exp_name,
+        "num_iterations": num_iterations,
+        "warmup_iters": warmup_iters,
+        "cosine_cycle_iters": cosine_cycle_iters,
+        "max_learning_rate": max_learning_rate,
+        "min_learning_rate": min_learning_rate,
+        "max_l2_norm": max_l2_norm,
+        "beta_1": beta_1,
+        "beta_2": beta_2,
+        "epsilon": epsilon,
+        "weight_decay": lam,
+        "batch_size": batch_size,
+        "context_length": context_length,
+        "vocab_size": vocab_size,
+        "d_model": d_model,
+        "num_layers": num_layers,
+        "num_heads": num_heads,
+        "d_ff": d_ff,
+        "rope_theta": rope_theta,
+        "device": device,
+        "train_dataset_path": train_dataset_path,
+        "val_dataset_path": val_dataset_path,
+        "eval_interval": eval_interval,
+        "eval_batches": eval_batches,
+    }
+    logger = ExperimentLogger(log_dir, config)
+    print(f"Logging to: {log_dir}")
+
     @torch.no_grad()
     def evaluate(dataset):
         """Compute average loss over eval_batches."""
@@ -83,10 +115,6 @@ def train(
         model.train()
         return total_loss / eval_batches
 
-    losses = []
-    val_losses = []
-    val_iters = []
-    
     print("Starting training")
     model.train()
     
@@ -100,7 +128,6 @@ def train(
         labels_flat = rearrange(labels, "batch_size context_length -> (batch_size context_length)")
         loss = cross_entropy(logits_flat, labels_flat)
         
-        losses.append(loss.item())
         loss.backward() 
 
         gradient_clipping(model.parameters(), max_l2_norm)
@@ -111,46 +138,32 @@ def train(
         
         optimizer.step()
 
+        # Log training loss every 10 steps (to save space)
         if it % 10 == 0:
+            logger.log(iteration=it, train_loss=loss.item(), lr=lr)
             print(f"iter {it}: train_loss={loss.item():.4f}, lr={lr:.2e}")
 
         # Evaluate and checkpoint periodically
         if it % eval_interval == 0:
             if val_dataset is not None:
                 val_loss = evaluate(val_dataset)
-                val_losses.append(val_loss)
-                val_iters.append(it)
+                logger.log(iteration=it, val_loss=val_loss)
                 print(f"iter {it}: val_loss={val_loss:.4f}, perplexity={np.exp(val_loss):.2f}")
+            
+            # Update the plot on disk
+            logger.plot()
+            
+            # Save checkpoint
             save_checkpoint(model, optimizer, iteration=it, out=checkpoint_path)
         
     # Save final checkpoint
     save_checkpoint(model, optimizer, iteration=num_iterations, out=checkpoint_path)
     
-    # Plot the loss curve
-    plot_losses(losses, val_losses, val_iters, checkpoint_path)
+    # Final plot
+    logger.plot()
+    print(f"Training complete. Logs saved to: {log_dir}")
     
-    return model, losses, val_losses
-
-
-def plot_losses(train_losses, val_losses, val_iters, checkpoint_path):
-    """Plot and save the training and validation loss curves."""
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Train Loss', alpha=0.7)
-    if val_losses:
-        plt.plot(val_iters, val_losses, 'ro-', label='Val Loss', markersize=4)
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Curve')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # Save next to checkpoint
-    plot_path = str(checkpoint_path).replace('.pt', '_loss.png')
-    if plot_path == str(checkpoint_path):
-        plot_path = str(checkpoint_path) + '_loss.png'
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Loss plot saved to {plot_path}")
+    return model, logger
 
 
 def main():
@@ -217,6 +230,10 @@ def main():
     parser.add_argument("--eval-batches", type=int, default=10,
                         help="Number of batches for evaluation")
     
+    # Experiment logging args
+    parser.add_argument("--exp-name", type=str, default="default_experiment",
+                        help="Experiment name for logging directory")
+    
     args = parser.parse_args()
     
     train(
@@ -245,6 +262,7 @@ def main():
         rope_theta=args.rope_theta,
         eval_interval=args.eval_interval,
         eval_batches=args.eval_batches,
+        exp_name=args.exp_name,
     )
 
 
