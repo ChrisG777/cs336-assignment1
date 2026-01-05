@@ -1,0 +1,29 @@
+Best experiment: ts_medium_lr1e-3_bs64_wd0.01
+  Val Loss: 1.5115
+  Perplexity: 4.53
+
+Config:
+  exp_name: ts_medium_lr1e-3_bs64_wd0.01
+  num_iterations: 5000
+  warmup_iters: 500
+  cosine_cycle_iters: 5000
+  max_learning_rate: 0.001
+  min_learning_rate: 1e-05
+  max_l2_norm: 1.0
+  beta_1: 0.9
+  beta_2: 0.999
+  epsilon: 1e-08
+  weight_decay: 0.01
+  batch_size: 64
+  context_length: 256
+  vocab_size: 10000
+  d_model: 384
+  num_layers: 6
+  num_heads: 6
+  d_ff: 1536
+  rope_theta: 10000.0
+  device: cuda
+  train_dataset_path: tokenized/tinystories_train.npy
+  val_dataset_path: tokenized/tinystories_valid.npy
+  eval_interval: 500
+  eval_batches: 20
