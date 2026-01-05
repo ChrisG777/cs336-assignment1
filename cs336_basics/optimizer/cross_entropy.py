@@ -20,7 +20,7 @@ def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[
 
 
     average over i: -log softmax(o_i)[x_i+1]
-    = average over i: -log (exp(o_i[x_i+1]) / sum over a \in vocab exp(o_i[a]))
+    = average over i: -log (exp(o_i[x_i+1]) / sum over a in vocab exp(o_i[a]))
     = average over  i: -o_i[x_i+1] + log(sum over exp(o_i[a]))
     """
     # subtract the largest element from inputs for numerical stability 
