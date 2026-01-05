@@ -18,7 +18,6 @@ cd ~/cs336-assignment1/
 TMP_DIR="/home/$USER/orcd/scratch/tok_shards_ts_val_$$"
 
 # --- CONFIGURATION ---
-# Input: Assuming standard filename. CHECK THIS PATH!
 INPUT_FILE="./data/TinyStoriesV2-GPT4-valid.txt"
 
 # Vocab/Merges: MUST use the ones generated from TRAINING
