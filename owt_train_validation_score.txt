@@ -1,0 +1,22 @@
+Evaluating OWT Model on Validation Set
+Started at: Mon Jan  5 02:03:03 EST 2026
+============================================
+Loading model from: checkpoints/owt_model.pt
+Validation dataset: tokenized/owt_valid_tokens.npy
+Val dataset shape: (66419423,), dtype: uint16
+Loaded checkpoint from iteration: 10000
+Evaluating on 100 batches...
+  Batch 20/100: running avg loss = 4.3757
+  Batch 40/100: running avg loss = 4.3844
+  Batch 60/100: running avg loss = 4.3852
+  Batch 80/100: running avg loss = 4.3763
+  Batch 100/100: running avg loss = 4.3730
+
+============================================
+RESULTS
+============================================
+Validation Loss: 4.3730
+Perplexity: 79.28
+============================================
+
+Finished at: Mon Jan  5 02:03:14 EST 2026
